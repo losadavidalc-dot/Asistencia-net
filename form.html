@@ -7,49 +7,238 @@
   <style>
     html, body { margin:0; padding:0; height:100%; }
     iframe { width:100%; height:100%; border:0; }
-    .msg{
+    .wrap {
       font-family: system-ui, Arial, sans-serif;
-      padding:20px; text-align:center;
+      height:100%;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      padding:24px;
+      text-align:center;
     }
+    .card{
+      width:100%;
+      max-width:520px;
+      background:#fff;
+      border-radius:14px;
+      padding:22px 20px;
+      box-shadow:0 2px 12px rgba(0,0,0,.08);
+    }
+    .ok{ color:#0a7a0a; font-weight:700; }
+    .bad{ color:#b00020; font-weight:700; }
+    .muted{ color:#666; font-size:14px; }
+    button{
+      background:#004aad; color:#fff; border:0;
+      padding:12px 18px; border-radius:8px;
+      font-size:16px; cursor:pointer; margin-top:12px;
+    }
+    button.secondary{ background:#eee; color:#111; }
+    .small{ font-size:13px; color:#777; margin-top:8px; }
+    body{ background:#f5f7fa; }
   </style>
 </head>
 <body>
-  <div id="wrap" class="msg">Validando acceso...</div>
+  <div id="root" class="wrap">
+    <div class="card">
+      <div id="msg">Validando acceso...</div>
+      <div id="detail" class="small"></div>
+      <div id="actions"></div>
+    </div>
+  </div>
 
 <script>
+/** =========================
+ * CONFIG
+ * ========================= */
 const FORM_URL = "https://forms.office.com/r/e418pQnBS0?origin=lprLink";
+const VALIDATE_URL = "/.netlify/functions/validate";
+const RADIO_PERMITIDO = 500; // metros
 
-async function main(){
-  const params = new URLSearchParams(location.search);
-  const token = params.get("token");
+const SEDES = [
+  { nombre: "SEDE GAIRA KM7",     lat: 11.18957,  lng: -74.21414 },
+  { nombre: "RELLENO SANITARIO", lat: 11.256635, lng: -74.157481 },
+  { nombre: "REBOMBEO",          lat: 11.18702,  lng: -74.2173 },
+  { nombre: "CAN CLL 22",        lat: 11.23625,  lng: -74.18786 },
+  { nombre: "PTAP MAMATOCO",     lat: 11.224788, lng: -74.160243 }
+];
 
-  if(!token){
-    location.replace("/"); 
+// Cada cuánto revalidar GPS
+const INTERVALO_MS = 60 * 1000; // 1 minuto
+
+/** =========================
+ * UI
+ * ========================= */
+const root = document.getElementById("root");
+const msgEl = document.getElementById("msg");
+const detEl = document.getElementById("detail");
+const actEl = document.getElementById("actions");
+
+let token = null;
+let timerId = null;
+let iframeMostrado = false;
+
+/** =========================
+ * Helpers
+ * ========================= */
+function setMsg(html, detail=""){
+  msgEl.innerHTML = html;
+  detEl.textContent = detail;
+}
+
+function botones(html){
+  actEl.innerHTML = html || "";
+}
+
+function salir(){
+  // Vuelve a la raíz para que tenga que re-escanear (y pedir token nuevo)
+  window.location.replace("/");
+}
+
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat/2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLon/2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
+function sedeMasCercana(latUser, lngUser){
+  let mejor = null;
+  for (const sede of SEDES) {
+    const d = haversineMeters(latUser, lngUser, sede.lat, sede.lng);
+    if (!mejor || d < mejor.dist) mejor = { ...sede, dist: d };
+  }
+  return mejor;
+}
+
+async function validarToken(){
+  const r = await fetch(`${VALIDATE_URL}?token=${encodeURIComponent(token)}`, { cache: "no-store" });
+  const data = await r.json();
+  return !!data.ok;
+}
+
+/** =========================
+ * GPS check (1 minuto)
+ * ========================= */
+function pedirUbicacionUnaVezYContinuar(){
+  if (!navigator.geolocation) {
+    setMsg("<span class='bad'>❌ Tu dispositivo no soporta geolocalización.</span>");
+    botones(`<button onclick="salir()">Volver</button>`);
     return;
   }
 
-  try{
-    const r = await fetch(`/.netlify/functions/validate?token=${encodeURIComponent(token)}`, { cache:"no-store" });
-    const data = await r.json();
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      // Primera comprobación y luego cada 1 minuto
+      comprobarRango(pos);
+      if (timerId) clearInterval(timerId);
+      timerId = setInterval(() => {
+        navigator.geolocation.getCurrentPosition(
+          (p) => comprobarRango(p),
+          () => { /* si falla una lectura, no expulsamos; reintenta en el próximo minuto */ },
+          { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+        );
+      }, INTERVALO_MS);
+    },
+    (err) => {
+      let texto = "⚠️ No se pudo obtener tu ubicación.";
+      if (err.code === 1) texto = "⚠️ Debes permitir el acceso a tu ubicación.";
+      if (err.code === 2) texto = "⚠️ Ubicación no disponible. Revisa GPS/Internet.";
+      if (err.code === 3) texto = "⚠️ Tiempo de espera agotado.";
 
-    if(!data.ok){
-      location.replace("/");
-      return;
-    }
+      setMsg(`<span class='bad'>${texto}</span>`);
+      botones(`
+        <button onclick="pedirUbicacionUnaVezYContinuar()">Reintentar</button>
+        <button class="secondary" onclick="salir()">Volver</button>
+      `);
+    },
+    { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+  );
+}
 
-    document.getElementById("wrap").outerHTML = `
-      <iframe src="${FORM_URL}" allow="geolocation *"></iframe>
-    `;
+function comprobarRango(pos){
+  const latUser = pos.coords.latitude;
+  const lngUser = pos.coords.longitude;
+  const accuracy = pos.coords.accuracy;
 
-    // Quitar token de la barra
+  const mejor = sedeMasCercana(latUser, lngUser);
+
+  // Si se sale del rango: bloquear y expulsar
+  if (mejor.dist > RADIO_PERMITIDO) {
+    if (timerId) clearInterval(timerId);
+
+    setMsg(
+      `<span class="bad">⛔ Saliste del perímetro permitido.</span><br>
+       Estás a <b>${Math.round(mejor.dist)} m</b> del punto más cercano.<br>
+       Sede más cercana: <b>${mejor.nombre}</b><br>
+       <span class="muted">Debes volver a escanear el QR en la sede.</span>`,
+      `Precisión GPS aprox: ±${Math.round(accuracy)} m`
+    );
+
+    botones(`<button onclick="salir()">Volver</button>`);
+    return;
+  }
+
+  // Si está dentro y aún no mostramos el iframe, mostrarlo
+  if (!iframeMostrado) {
+    iframeMostrado = true;
+
+    // Quitar token de la URL (para que no quede guardado)
     history.replaceState({}, "", "/form.html");
 
-  }catch(e){
-    location.replace("/");
+    // IMPORTANTE: SIN allow="geolocation *" para evitar doble prompt
+    root.innerHTML = `<iframe src="${FORM_URL}"></iframe>`;
   }
 }
 
-main();
+/** =========================
+ * Main
+ * ========================= */
+(async function main(){
+  const params = new URLSearchParams(location.search);
+  token = params.get("token");
+
+  if (!token) {
+    salir();
+    return;
+  }
+
+  try {
+    const ok = await validarToken();
+    if (!ok) {
+      setMsg("<span class='bad'>⛔ Acceso inválido o expirado.</span><br><span class='muted'>Vuelve a escanear el QR.</span>");
+      botones(`<button onclick="salir()">Volver</button>`);
+      return;
+    }
+
+    setMsg("<span class='ok'>✅ Acceso validado.</span><br><span class='muted'>Confirmando ubicación…</span>");
+
+    // Aquí es donde pedimos ubicación (solo 1 permiso, y luego revalidamos cada 1 minuto)
+    pedirUbicacionUnaVezYContinuar();
+
+  } catch (e) {
+    setMsg("<span class='bad'>⚠️ Error validando acceso.</span><br><span class='muted'>Vuelve a escanear el QR.</span>");
+    botones(`<button onclick="salir()">Volver</button>`);
+  }
+})();
+
+// Si el usuario vuelve a la pestaña, hacemos un chequeo inmediato
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "visible" && iframeMostrado && navigator.geolocation) {
+    navigator.geolocation.getCurrentPosition(
+      (p) => comprobarRango(p),
+      () => {},
+      { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+    );
+  }
+});
 </script>
 </body>
 </html>
+
+
