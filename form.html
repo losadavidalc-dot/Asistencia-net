@@ -7,46 +7,179 @@
   <style>
     html, body { margin:0; padding:0; height:100%; }
     iframe { width:100%; height:100%; border:0; }
-    .msg{
+    .wrap{
       font-family: system-ui, Arial, sans-serif;
       padding:20px; text-align:center;
     }
+    .ok{ color:#0a7a0a; font-weight:700; }
+    .bad{ color:#b00020; font-weight:700; }
+    button{
+      background:#004aad; color:#fff; border:0;
+      padding:12px 18px; border-radius:8px;
+      font-size:16px; cursor:pointer; margin-top:10px;
+    }
+    .small{ font-size:13px; color:#777; margin-top:6px; }
   </style>
 </head>
 <body>
-  <div id="wrap" class="msg">Validando acceso...</div>
+  <div id="wrap" class="wrap">Validando acceso...</div>
 
 <script>
+/** ====== CONFIG ====== */
 const FORM_URL = "https://forms.office.com/r/e418pQnBS0?origin=lprLink";
+const RADIO_PERMITIDO = 500; // metros
+const SEDES = [
+  { nombre: "SEDE GAIRA KM7",     lat: 11.18957,  lng: -74.21414 },
+  { nombre: "RELLENO SANITARIO", lat: 11.256635, lng: -74.157481 },
+  { nombre: "REBOMBEO",          lat: 11.18702,  lng: -74.2173 },
+  { nombre: "CAN CLL 22",        lat: 11.23625,  lng: -74.18786 },
+  { nombre: "PTAP MAMATOCO",     lat: 11.224788, lng: -74.160243 }
+];
+
+const CHECK_EVERY_MS = 15000; // cada 15s (puedes subir a 30s si quieres)
+const GEO_OPTIONS = { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 };
+
+/** ====== HELPERS ====== */
+function haversineMeters(lat1, lon1, lat2, lon2) {
+  const R = 6371000;
+  const toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat/2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
+    Math.sin(dLon/2) ** 2;
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+  return R * c;
+}
+
+function nearestSede(latUser, lngUser) {
+  let mejor = null;
+  for (const sede of SEDES) {
+    const d = haversineMeters(latUser, lngUser, sede.lat, sede.lng);
+    if (!mejor || d < mejor.dist) mejor = { ...sede, dist: d };
+  }
+  return mejor;
+}
+
+function getPosition() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) return reject({ code: "NO_GEO" });
+    navigator.geolocation.getCurrentPosition(resolve, reject, GEO_OPTIONS);
+  });
+}
+
+/** ====== FLUJO ====== */
+const wrap = document.getElementById("wrap");
+let watcher = null;
+
+async function validarToken(token){
+  const r = await fetch(`/.netlify/functions/validate?token=${encodeURIComponent(token)}`, { cache:"no-store" });
+  const data = await r.json();
+  return !!data.ok;
+}
+
+function bloquearPorFueraDeZona(mejor, accuracy){
+  // Quita el iframe y bloquea
+  if (watcher) { clearInterval(watcher); watcher = null; }
+
+  wrap.innerHTML = `
+    <div class="bad">❌ Te saliste del perímetro permitido.</div>
+    <div style="margin-top:8px">
+      Estás a <b>${Math.round(mejor.dist)} m</b> del punto más cercano.<br>
+      Sede más cercana: <b>${mejor.nombre}</b>
+    </div>
+    <div class="small" style="margin-top:8px">
+      Precisión GPS aprox: ±${Math.round(accuracy)} m
+    </div>
+    <button id="btnVolver">Volver y escanear de nuevo</button>
+  `;
+
+  document.getElementById("btnVolver").addEventListener("click", () => {
+    location.replace("/"); // obliga a pasar por QR + GPS + token otra vez
+  });
+}
+
+function mostrarForm(){
+  wrap.outerHTML = `<iframe id="formFrame" src="${FORM_URL}"></iframe>`;
+  // Quitar token de la barra (para que no quede guardado)
+  history.replaceState({}, "", "/form.html");
+}
+
+async function validarGPSUnaVez(){
+  const pos = await getPosition();
+  const latUser = pos.coords.latitude;
+  const lngUser = pos.coords.longitude;
+  const acc = pos.coords.accuracy;
+
+  const mejor = nearestSede(latUser, lngUser);
+  return { ok: (mejor.dist <= RADIO_PERMITIDO), mejor, acc };
+}
+
+async function iniciarVigilancia(){
+  watcher = setInterval(async () => {
+    try{
+      const { ok, mejor, acc } = await validarGPSUnaVez();
+      if (!ok) bloquearPorFueraDeZona(mejor, acc);
+    }catch{
+      // Si no puede obtener GPS, por seguridad bloqueamos
+      wrap.innerHTML = `
+        <div class="bad">⚠️ No se pudo confirmar tu ubicación.</div>
+        <div class="small">Activa GPS e intenta nuevamente (debes estar en la sede).</div>
+        <button id="btnVolver">Volver</button>
+      `;
+      document.getElementById("btnVolver").addEventListener("click", () => location.replace("/"));
+      if (watcher) { clearInterval(watcher); watcher = null; }
+    }
+  }, CHECK_EVERY_MS);
+}
 
 async function main(){
   const params = new URLSearchParams(location.search);
   const token = params.get("token");
 
   if(!token){
-    location.replace("/"); 
+    location.replace("/");
     return;
   }
 
+  // 1) Validar token
   try{
-    const r = await fetch(`/.netlify/functions/validate?token=${encodeURIComponent(token)}`, { cache:"no-store" });
-    const data = await r.json();
-
-    if(!data.ok){
+    const okToken = await validarToken(token);
+    if(!okToken){
       location.replace("/");
       return;
     }
-
-    document.getElementById("wrap").outerHTML = `
-      <iframe src="${FORM_URL}" allow="geolocation *"></iframe>
-    `;
-
-    // Quitar token de la barra
-    history.replaceState({}, "", "/form.html");
-
-  }catch(e){
+  }catch{
     location.replace("/");
+    return;
   }
+
+  // 2) Pedir ubicación aquí también (evita que entren a form.html sin estar en sede)
+  // Nota: En iPhone puede requerir gesto del usuario. Si falla, mostramos botón.
+  wrap.innerHTML = `
+    <div>Para continuar, confirma tu ubicación (debes estar en la sede).</div>
+    <button id="btnContinuar">Confirmar ubicación</button>
+    <div class="small">Esto evita que puedas llenarla luego desde tu casa.</div>
+    <div id="msg2" class="small" style="margin-top:10px"></div>
+  `;
+
+  document.getElementById("btnContinuar").addEventListener("click", async () => {
+    const msg2 = document.getElementById("msg2");
+    msg2.textContent = "📡 Confirmando ubicación...";
+    try{
+      const { ok, mejor, acc } = await validarGPSUnaVez();
+      if(!ok){
+        bloquearPorFueraDeZona(mejor, acc);
+        return;
+      }
+      // 3) Mostrar form y empezar vigilancia
+      mostrarForm();
+      iniciarVigilancia();
+    }catch(err){
+      msg2.textContent = "⚠️ No se pudo obtener GPS. Revisa permisos/GPS e intenta de nuevo.";
+    }
+  });
 }
 
 main();
