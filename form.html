@@ -59,7 +59,6 @@
  */
 const RECHECK_MS = 60_000; // 1 minuto
 
-// Tu link actual de Microsoft Forms (el que pegaste)
 const FORM_URL = "https://forms.office.com/pages/responsepage.aspx?id=phunyhs3akmGvKPvvktvmxNRWgTyZ2VAuDflhEb8kKNUMkc5OEs0WjM3QVU4OEdTUzJJSDZMSEI4WS4u&origin=lprLink&route=shorturl";
 
 /**
@@ -72,8 +71,44 @@ const overlay = document.getElementById("overlay");
 
 let intervalId = null;
 
+// ⏱️ para el “reloj” (cuenta regresiva)
+let countdownId = null;
+let secondsLeft = Math.floor(RECHECK_MS / 1000);
+let lastDistanceText = "OK";
+
 /**
- * Bloqueo total (si sale del área o si falla la validación)
+ * Utilidad: formatea mm:ss
+ */
+function fmtTime(sec){
+  const m = String(Math.floor(sec / 60)).padStart(2, "0");
+  const s = String(sec % 60).padStart(2, "0");
+  return `${m}:${s}`;
+}
+
+function renderTopbar(){
+  topbar.textContent = `Acceso permitido · Revalidación en ${fmtTime(secondsLeft)} · Distancia: ${lastDistanceText}`;
+}
+
+function startCountdown(){
+  stopCountdown();
+  secondsLeft = Math.floor(RECHECK_MS / 1000);
+  renderTopbar();
+
+  countdownId = setInterval(() => {
+    secondsLeft = Math.max(0, secondsLeft - 1);
+    renderTopbar();
+  }, 1000);
+}
+
+function stopCountdown(){
+  if(countdownId){
+    clearInterval(countdownId);
+    countdownId = null;
+  }
+}
+
+/**
+ * Bloqueo total
  */
 function lock(reasonText){
   topbar.textContent = reasonText || "Acceso bloqueado";
@@ -82,12 +117,11 @@ function lock(reasonText){
   frame.style.display = "none";
   overlay.style.display = "block";
   if(intervalId) clearInterval(intervalId);
+  stopCountdown();
 }
 
 /**
- * Llama al backend para validar token + GPS (en la función validate)
- * OJO: Esto asume que tu validate.js ya devuelve:
- *   { ok: true/false, distance_m: number, site?: string }
+ * Valida token + GPS
  */
 async function validateTokenAndGPS(token){
   const r = await fetch(`/.netlify/functions/validate?token=${encodeURIComponent(token)}`, {
@@ -100,33 +134,35 @@ async function start(){
   const params = new URLSearchParams(location.search);
   const token = params.get("token");
 
-  // Si entra sin token -> vuelve al inicio
   if(!token){
     location.replace("/");
     return;
   }
 
   try{
-    // 1) Validación inicial
     msg.textContent = "Validando acceso…";
     topbar.textContent = "Validando acceso…";
 
+    // 1) Validación inicial
     const first = await validateTokenAndGPS(token);
-
     if(!first || !first.ok){
-      // si no está permitido, fuera
       return lock("Fuera del área permitida");
     }
 
-    // 2) Acceso permitido -> cargar forms
-    const distTxt = (typeof first.distance_m === "number") ? `${Math.round(first.distance_m)} m` : "OK";
-    topbar.textContent = `Acceso permitido · Revalidación cada 1 minuto · Distancia: ${distTxt}`;
+    // 2) Acceso permitido
+    lastDistanceText = (typeof first.distance_m === "number")
+      ? `${Math.round(first.distance_m)} m`
+      : "OK";
+
     msg.textContent = "";
     frame.src = FORM_URL;
     frame.style.display = "block";
 
-    // 3) Ocultar el token de la barra de direcciones
+    // Quitar token de la barra
     history.replaceState({}, "", "/form.html");
+
+    // 3) Iniciar “reloj” regresivo
+    startCountdown();
 
     // 4) Revalidación cada 1 minuto
     intervalId = setInterval(async () => {
@@ -137,11 +173,14 @@ async function start(){
           return lock("Fuera del área permitida");
         }
 
-        const d2 = (typeof v.distance_m === "number") ? `${Math.round(v.distance_m)} m` : "OK";
-        topbar.textContent = `Acceso permitido · Revalidación cada 1 minuto · Distancia: ${d2}`;
+        lastDistanceText = (typeof v.distance_m === "number")
+          ? `${Math.round(v.distance_m)} m`
+          : "OK";
+
+        // reinicia el reloj cuando revalida
+        startCountdown();
 
       }catch(e){
-        // Si hay error, mejor bloquear
         lock("No se pudo revalidar ubicación");
       }
     }, RECHECK_MS);
@@ -155,5 +194,7 @@ start();
 </script>
 </body>
 </html>
+
+
 
 
