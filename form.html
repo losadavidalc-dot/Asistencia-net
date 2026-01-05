@@ -6,50 +6,157 @@
   <title>Encuesta</title>
   <style>
     html, body { margin:0; padding:0; height:100%; }
-    iframe { width:100%; height:100%; border:0; }
-    .msg{
-      font-family: system-ui, Arial, sans-serif;
-      padding:20px; text-align:center;
+    body { font-family: system-ui, Arial, sans-serif; }
+
+    #topbar{
+      padding:12px 14px;
+      text-align:center;
+      background:#f5f7fa;
+      border-bottom:1px solid #e5e7eb;
+      font-size:14px;
+    }
+
+    iframe { width:100%; height:calc(100% - 52px); border:0; display:none; }
+
+    #overlay{
+      position:fixed; inset:0;
+      display:none;
+      background:rgba(0,0,0,.80);
+      color:#fff;
+      text-align:center;
+      padding:24px;
+      z-index:9999;
+    }
+
+    #overlay h2{ margin:16px 0 10px; }
+    #overlay p{ margin:0 0 14px; line-height:1.4; }
+    button{
+      padding:12px 18px;
+      border:0;
+      border-radius:10px;
+      cursor:pointer;
+      font-weight:700;
     }
   </style>
 </head>
 <body>
-  <div id="wrap" class="msg">Validando acceso...</div>
+
+  <div id="topbar">Validando ubicación…</div>
+
+  <div id="overlay">
+    <h2>Fuera del área permitida</h2>
+    <p>Debes volver a escanear el código QR en la sede autorizada para continuar.</p>
+    <button onclick="location.replace('/')">Volver</button>
+  </div>
+
+  <iframe id="formsFrame" src=""></iframe>
 
 <script>
-const FORM_URL = "https://forms.office.com/r/e418pQnBS0?origin=lprLink";
+  // ✅ TU URL REAL DE MICROSOFT FORMS (fija, no te pregunto nada)
+  const FORM_URL = "https://forms.office.com/pages/responsepage.aspx?id=phunyhs3akmGvKPvvktvmxNRWgTyZ2VAuDflhEb8kKNUMkc5OEs0WjM3QVU4OEdTUzJJSDZMSEI4WS4u&origin=lprLink&route=shorturl";
 
-async function main(){
-  const params = new URLSearchParams(location.search);
-  const token = params.get("token");
+  // ✅ revalidación cada 1 minuto
+  const RECHECK_MS = 60_000;
 
-  if(!token){
-    location.replace("/"); 
-    return;
+  const topbar = document.getElementById("topbar");
+  const overlay = document.getElementById("overlay");
+  const frame = document.getElementById("formsFrame");
+
+  let tokenGuardado = null;
+  let intervalId = null;
+
+  function leerToken() {
+    const params = new URLSearchParams(location.search);
+    return params.get("token");
   }
 
-  try{
-    const r = await fetch(`/.netlify/functions/validate?token=${encodeURIComponent(token)}`, { cache:"no-store" });
-    const data = await r.json();
+  function getLocation() {
+    return new Promise((resolve, reject) => {
+      if (!navigator.geolocation) return reject(new Error("No geolocation"));
+      navigator.geolocation.getCurrentPosition(
+        (pos) => resolve({
+          lat: pos.coords.latitude,
+          lng: pos.coords.longitude,
+          acc: pos.coords.accuracy
+        }),
+        (err) => reject(err),
+        { enableHighAccuracy: true, timeout: 20000, maximumAge: 0 }
+      );
+    });
+  }
 
-    if(!data.ok){
+  async function validarConBackend(lat, lng) {
+    const r = await fetch(`/.netlify/functions/validate?token=${encodeURIComponent(tokenGuardado)}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      cache: "no-store",
+      body: JSON.stringify({ lat, lng })
+    });
+    return await r.json();
+  }
+
+  function bloquear(mensaje) {
+    overlay.style.display = "block";
+    frame.style.display = "none";
+    frame.src = "";
+    topbar.textContent = mensaje || "Fuera del área permitida.";
+  }
+
+  function permitir(mensaje) {
+    overlay.style.display = "none";
+    frame.style.display = "block";
+    if (!frame.src) frame.src = FORM_URL;
+    topbar.textContent = mensaje || "Acceso permitido.";
+  }
+
+  async function check() {
+    try {
+      const loc = await getLocation();
+
+      const data = await validarConBackend(loc.lat, loc.lng);
+
+      if (!data || data.ok !== true) {
+        bloquear("Fuera del área permitida. Debes volver a escanear el QR.");
+        return;
+      }
+
+      const dist = (typeof data.distance_m === "number") ? data.distance_m : null;
+      const sede = data.sede ? data.sede : "";
+
+      const msg =
+        `Acceso permitido ${sede ? "· " + sede : ""}` +
+        `${dist !== null ? " · Distancia: " + Math.round(dist) + " m" : ""}` +
+        ` · Revalidación cada 1 minuto`;
+
+      permitir(msg);
+
+    } catch (e) {
+      bloquear("No se pudo validar ubicación. Activa GPS e Internet y vuelve a escanear.");
+    }
+  }
+
+  async function main() {
+    const token = leerToken();
+
+    if (!token) {
       location.replace("/");
       return;
     }
 
-    document.getElementById("wrap").outerHTML = `
-      <iframe src="${FORM_URL}" allow="geolocation *"></iframe>
-    `;
+    tokenGuardado = token;
 
-    // Quitar token de la barra
+    // validación inicial
+    await check();
+
+    // quitar token de la barra (para que no lo copien fácil)
     history.replaceState({}, "", "/form.html");
 
-  }catch(e){
-    location.replace("/");
+    // revalidación cada 1 minuto
+    intervalId = setInterval(check, RECHECK_MS);
   }
-}
 
-main();
+  main();
 </script>
 </body>
 </html>
+
